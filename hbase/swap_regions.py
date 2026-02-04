@@ -36,38 +36,64 @@ def analyze_distribution(meta_file):
     - server_table_count: {server: {table: count}} 每个 server 上每个表的 region 数
     - region_info: {encoded_name: (table, server)} 每个 region 的信息
     - server_table_regions: {server: {table: [encoded_names]}} 每个 server 上每个表的 region 列表
+    - server_fullname: {server_host: "host,port,startcode"} 完整 server name 映射
     """
     server_table_count = defaultdict(lambda: defaultdict(int))
     region_info = {}
     server_table_regions = defaultdict(lambda: defaultdict(list))
+    server_fullname = {}  # host -> "host,port,startcode"
     
-    # 匹配 meta 表信息的正则
-    # 典型格式: table_name,start_key,timestamp.encoded_name. column=info:server, timestamp=..., value=server:port
+    # 匹配 info:server 行
     # 示例: search:search_dump_ads,,1638534531339.b9eab026abc3d8b05780fbd9fa7e5846. column=info:server, timestamp=1755674711320, value=aws-ir1-...:16020
-    region_pattern = re.compile(
+    server_pattern = re.compile(
         r"^\s*(\S+),.*\.([a-f0-9]+)\.\s+column=info:server,\s*timestamp=\d+,\s*value=([^:]+):(\d+)"
     )
     
+    # 匹配 info:serverstartcode 行
+    # 示例: search:search_dump_ads,,1638534531339.b9eab026abc3d8b05780fbd9fa7e5846. column=info:serverstartcode, timestamp=1755674711320, value=1740626070375
+    startcode_pattern = re.compile(
+        r"^\s*(\S+),.*\.([a-f0-9]+)\.\s+column=info:serverstartcode,\s*timestamp=\d+,\s*value=(\d+)"
+    )
+    
+    # 临时存储每个 region 的 server 信息
+    region_server_info = {}  # encoded_name -> (table, host, port)
+    
     with open(meta_file, 'r') as f:
         for line in f:
-            match = region_pattern.search(line)
+            # 解析 info:server 行
+            match = server_pattern.search(line)
             if match:
                 full_table_name = match.group(1)
                 encoded_name = match.group(2)
                 server_host = match.group(3)
+                server_port = match.group(4)
                 
-                # 提取表名 (处理 namespace，去掉 start_key 部分)
                 table_name = full_table_name.split(',')[0]
                 
-                # 跳过系统表
                 if table_name.startswith('hbase:'):
                     continue
                 
-                server_table_count[server_host][table_name] += 1
-                region_info[encoded_name] = (table_name, server_host)
-                server_table_regions[server_host][table_name].append(encoded_name)
+                region_server_info[encoded_name] = (table_name, server_host, server_port)
+                continue
+            
+            # 解析 info:serverstartcode 行
+            match = startcode_pattern.search(line)
+            if match:
+                encoded_name = match.group(2)
+                startcode = match.group(3)
+                
+                if encoded_name in region_server_info:
+                    table_name, server_host, server_port = region_server_info[encoded_name]
+                    
+                    # 构建完整 server name: host,port,startcode
+                    full_server_name = f"{server_host},{server_port},{startcode}"
+                    server_fullname[server_host] = full_server_name
+                    
+                    server_table_count[server_host][table_name] += 1
+                    region_info[encoded_name] = (table_name, server_host)
+                    server_table_regions[server_host][table_name].append(encoded_name)
     
-    return server_table_count, region_info, server_table_regions
+    return server_table_count, region_info, server_table_regions, server_fullname
 
 
 def compute_table_avg(table_name, server_table_count):
@@ -234,7 +260,7 @@ def print_distribution(table_name, server_table_count, label="当前"):
         print(f"  {server}: {count} regions ({sign}{diff:.1f})")
 
 
-def generate_plan(swap_plan, output_file, hot_table):
+def generate_plan(swap_plan, output_file, hot_table, server_fullname):
     """生成 HBase shell 移动计划文件"""
     with open(output_file, 'w') as f:
         f.write("# Auto-generated swap plan for balancing\n")
@@ -243,9 +269,13 @@ def generate_plan(swap_plan, output_file, hot_table):
         f.write("balance_switch false\n\n")
         
         for i, (hot_region, cold_region, cold_table, source, target) in enumerate(swap_plan, 1):
+            # 获取完整的 server name (host,port,startcode)
+            source_full = server_fullname.get(source, source)
+            target_full = server_fullname.get(target, target)
+            
             f.write(f"# Pair {i}: {hot_table} ({source} -> {target}), {cold_table} ({target} -> {source})\n")
-            f.write(f"move '{hot_region}', '{target}'\n")
-            f.write(f"move '{cold_region}', '{source}'\n")
+            f.write(f"move '{hot_region}', '{target_full}'\n")
+            f.write(f"move '{cold_region}', '{source_full}'\n")
             f.write("\n")
         
         f.write("# balance_switch true # Uncomment to enable after verification\n")
@@ -258,7 +288,7 @@ def main():
     args = parse_args()
     
     print(f"Analyzing {args.meta_file}...")
-    server_table_count, region_info, server_table_regions = analyze_distribution(args.meta_file)
+    server_table_count, region_info, server_table_regions, server_fullname = analyze_distribution(args.meta_file)
     
     if not server_table_count:
         print("Error: No regions found in meta dump file")
@@ -345,7 +375,7 @@ def main():
                 print(f"  {server}: {before} ({sign_before}{diff_before:.1f}){change}")
     
     if not args.dry_run:
-        generate_plan(swap_plan, args.output, hot_table)
+        generate_plan(swap_plan, args.output, hot_table, server_fullname)
     else:
         print("\n[Dry run mode - no file generated]")
     
